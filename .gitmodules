@@ -7,3 +7,7 @@
 [submodule "strong_sort/deep/reid"]
 	path = strong_sort/deep/reid
 	url = https://github.com/KaiyangZhou/deep-person-reid
+[submodule "yolov6"]
+	path = yolov6
+	url = https://github.com/meituan/YOLOv6.git
+	branch = v3
