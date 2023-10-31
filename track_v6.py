@@ -13,6 +13,7 @@ os.environ["NUMEXPR_NUM_THREADS"] = "1"
 import time
 from pathlib import Path
 
+from tqdm import tqdm
 import cv2
 import torch
 import torch.backends.cudnn as cudnn
@@ -42,17 +43,99 @@ if str(ROOT / 'strong_sort') not in sys.path:
 ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 
 
-from yolov6.models.experimental import attempt_load
-from yolov6.utils.datasets import LoadStreams, LoadImages
-from yolov6.utils.general import check_img_size, check_requirements, check_imshow, non_max_suppression, apply_classifier, \
-    scale_coords, xyxy2xywh, strip_optimizer, set_logging, increment_path
-from yolov6.utils.plots import plot_one_box
-from yolov6.utils.torch_utils import select_device, load_classifier, time_synchronized, TracedModel
+#from yolov6.models.experimental import attempt_load
+#from yolov6.utils.datasets import LoadStreams, LoadImages
+#from yolov6.utils.general import check_requirements, check_imshow, non_max_suppression, apply_classifier, \
+#    scale_coords, strip_optimizer
+#from yolov6.utils.plots import plot_one_box
+#from yolov6.utils.torch_utils import select_device, load_classifier, time_synchronized, TracedModel
+
+from yolov6.utils.general import increment_name
+from yolov6.utils.events import LOGGER, load_yaml
+from yolov6.layers.common import DetectBackend
+from yolov6.data.data_augment import letterbox
+from yolov6.data.datasets import LoadData
+from yolov6.utils.nms import non_max_suppression
+from yolov6.utils.torch_utils import get_model_info
 
 from strong_sort.utils.parser import get_config
 from strong_sort.strong_sort import StrongSORT
+import math
 
+def plot_box_and_label(image, lw, box, label='', color=(128, 128, 128), txt_color=(255, 255, 255), font=cv2.FONT_HERSHEY_COMPLEX):
+    # Add one xyxy box to image with label
+    p1, p2 = (int(box[0]), int(box[1])), (int(box[2]), int(box[3]))
+    cv2.rectangle(image, p1, p2, color, thickness=lw, lineType=cv2.LINE_AA)
+    if label:
+        tf = max(lw - 1, 1)  # font thickness
+        w, h = cv2.getTextSize(label, 0, fontScale=lw / 3, thickness=tf)[0]  # text width, height
+        outside = p1[1] - h - 3 >= 0  # label fits outside box
+        p2 = p1[0] + w, p1[1] - h - 3 if outside else p1[1] + h + 3
+        cv2.rectangle(image, p1, p2, color, -1, cv2.LINE_AA)  # filled
+        cv2.putText(image, label, (p1[0], p1[1] - 2 if outside else p1[1] + h + 2), font, lw / 3, txt_color,
+                    thickness=tf, lineType=cv2.LINE_AA)
 
+def xyxy2xywh(x):
+    # Convert nx4 boxes from [x1, y1, x2, y2] to [x, y, w, h] where xy1=top-left, xy2=bottom-right
+    y = x.clone() if isinstance(x, torch.Tensor) else np.copy(x)
+    y[:, 0] = (x[:, 0] + x[:, 2]) / 2  # x center
+    y[:, 1] = (x[:, 1] + x[:, 3]) / 2  # y center
+    y[:, 2] = x[:, 2] - x[:, 0]  # width
+    y[:, 3] = x[:, 3] - x[:, 1]  # height
+    return y
+
+def rescale(ori_shape, boxes, target_shape):
+    '''Rescale the output to the original image shape'''
+    ratio = min(ori_shape[0] / target_shape[0], ori_shape[1] / target_shape[1])
+    padding = (ori_shape[1] - target_shape[1] * ratio) / 2, (ori_shape[0] - target_shape[0] * ratio) / 2
+
+    boxes[:, [0, 2]] -= padding[0]
+    boxes[:, [1, 3]] -= padding[1]
+    boxes[:, :4] /= ratio
+
+    boxes[:, 0].clamp_(0, target_shape[1])  # x1
+    boxes[:, 1].clamp_(0, target_shape[0])  # y1
+    boxes[:, 2].clamp_(0, target_shape[1])  # x2
+    boxes[:, 3].clamp_(0, target_shape[0])  # y2
+
+    return boxes
+
+def model_switch(model, img_size):
+    ''' Model switch to deploy status '''
+    from yolov6.layers.common import RepVGGBlock
+    for layer in model.modules():
+        if isinstance(layer, RepVGGBlock):
+            layer.switch_to_deploy()
+
+    LOGGER.info("Switch model to deploy modality.")
+
+def process_image(img_src, img_size, stride, half):
+    '''Process image before image inference.'''
+    image = letterbox(img_src, img_size, stride=stride)[0]
+    # Convert
+    image = image.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
+    image = torch.from_numpy(np.ascontiguousarray(image))
+    image = image.half() if half else image.float()  # uint8 to fp16/32
+    image /= 255  # 0 - 255 to 0.0 - 1.0
+
+    return image, img_src
+
+def make_divisible(x, divisor):
+    # Upward revision the value x to make it evenly divisible by the divisor.
+    return math.ceil(x / divisor) * divisor
+
+def check_img_size(img_size, s=32, floor=0):
+    """Make sure image size is a multiple of stride s in each dimension, and return a new shape list of image."""
+    if isinstance(img_size, int):  # integer i.e. img_size=640
+        new_size = max(make_divisible(img_size, int(s)), floor)
+    elif isinstance(img_size, list):  # list i.e. img_size=[640, 480]
+        new_size = [max(make_divisible(x, int(s)), floor) for x in img_size]
+    else:
+        raise Exception(f"Unsupported type of img_size: {type(img_size)}")
+
+    if new_size != img_size:
+        print(f'WARNING: --img-size {img_size} must be multiple of max stride {s}, updating to {new_size}')
+    return new_size if isinstance(img_size,list) else [new_size]*2
 
 def detect(save_img=False, line_thickness=1):
     source, weights, show_vid, save_txt, imgsz, trace = opt.source, opt.yolo_weights, opt.show_vid, opt.save_txt, opt.img_size, opt.trace
@@ -78,41 +161,29 @@ def detect(save_img=False, line_thickness=1):
 
 
     # Directories
-    save_dir = Path(increment_path(Path(opt.project) / opt.exp_name, exist_ok=opt.exist_ok))  # increment run
+    save_dir = Path(increment_name(Path(opt.project) / opt.exp_name))  # increment run
     (save_dir / 'labels' if save_txt else save_dir).mkdir(parents=True, exist_ok=True)  # make dir
 
     # Initialize
-    set_logging()
-    device = select_device(opt.device)
+    LOGGER.info("Initializing system")
+    cuda = opt.device != 'cpu' and torch.cuda.is_available()
+    device = torch.device(f'cuda:{opt.device}' if cuda else 'cpu')
     half = device.type != 'cpu'  # half precision only supported on CUDA
 
     # Load model
-    model = attempt_load(weights, map_location=device)  # load FP32 model
-    stride = int(model.stride.max())  # model stride
-    imgsz = check_img_size(imgsz, s=stride)  # check img_size
-
-    if trace:
-        model = TracedModel(model, device, opt.img_size)
+    LOGGER.info(weights)
+    model = DetectBackend(weights, device=device)
+    stride = int(model.stride)  # model stride
+    imgsz = check_img_size(img_size=imgsz, s=stride)  # check img_size
+    model_switch(model.model, imgsz)
 
     if half:
-        model.half()  # to FP16
-
-    # Second-stage classifier
-    classify = False
-    if classify:
-        modelc = load_classifier(name='resnet101', n=2)  # initialize
-        modelc.load_state_dict(torch.load('weights/resnet101.pt', map_location=device)['model']).to(device).eval()
+        model.model.half()  # to FP16
 
     # Set Dataloader
-    vid_path, vid_writer = None, None
-    if webcam:
-        view_img = check_imshow()
-        cudnn.benchmark = True  # set True to speed up constant image size inference
-        dataset = LoadStreams(source, img_size=imgsz, stride=stride)
-        nr_sources = len(dataset)
-    else:
-        dataset = LoadImages(source, img_size=imgsz, stride=stride)
-        nr_sources = 1
+
+    dataset = LoadData(source, webcam, 0)  #TODO: Webcam address instead of 0
+    nr_sources = 1
     vid_path, vid_writer, txt_path = [None] * nr_sources, [None] * nr_sources, [None] * nr_sources
 
     # initialize StrongSORT
@@ -140,50 +211,39 @@ def detect(save_img=False, line_thickness=1):
 
     trajectory = {}
     # Get names and colors
-    names = model.module.names if hasattr(model, 'module') else model.names
+    names = load_yaml(opt.yolo_yaml)['names']
+    LOGGER.info(names)
     colors = [[random.randint(0, 255) for _ in range(3)] for _ in names]
 
-    # Run inference
-    if device.type != 'cpu':
-        model(torch.zeros(1, 3, imgsz, imgsz).to(device).type_as(next(model.parameters())))  # run once
     t0 = time.time()
 
-    # Run tracking
-    # model.warmup(imgsz=(1 if pt else nr_sources, 3, *imgsz))  # warmup
     dt, seen = [0.0, 0.0, 0.0, 0.0], 0
     curr_frames, prev_frames = [None] * nr_sources, [None] * nr_sources
 
     # for path, img, im0s, vid_cap in dataset:
-    for frame_idx, (path, img, im0s, vid_cap) in enumerate(dataset):
-        t1 = time_synchronized()
-        img = torch.from_numpy(img).to(device)
-        img = img.half() if half else img.float()  # uint8 to fp16/32
-        img /= 255.0  # 0 - 255 to 0.0 - 1.0
-        if img.ndimension() == 3:
-            img = img.unsqueeze(0)
-        t2 = time_synchronized()
+    for frame_idx, (img, path, vid_cap) in enumerate(dataset):
+        t1 = time.time()
+        img, img_src = process_image(img, imgsz, stride, half)
+        img = img.to(device)
+        if len(img.shape) == 3:
+            img = img[None]
+            # expand for batch dim
+        t2 = time.time()
         dt[0] += t2 - t1
 
-        # Inference
-        pred = model(img, augment=opt.augment)[0]
-        t3 = time_synchronized()
+        pred_results = model(img)
+        t3 = time.time()
         dt[1] += t3 - t2
-        # Apply NMS
-        pred = non_max_suppression(pred, opt.conf_thres, opt.iou_thres, classes=opt.classes, agnostic=opt.agnostic_nms)
-        dt[2] += time_synchronized() - t3
 
-        # Apply Classifier
-        if classify:
-            pred = apply_classifier(pred, modelc, img, im0s)
-
-
+        pred = non_max_suppression(pred_results, opt.conf_thres, opt.iou_thres, opt.classes, opt.agnostic_nms, max_det=1000)[0] #TODO dynamic max_det
+        dt[2] += time.time() - t3
 
         # Process detections
-        for i, det in enumerate(pred):  # detections per image
+        for i, det in enumerate([pred]):  # detections per image
             if webcam:  # batch_size >= 1
-                p, s, im0, frame = path[i], '%g: ' % i, im0s[i].copy(), dataset.count
+                p, s, im0, frame = path[i], '%g: ' % i, img_src[i].copy(), dataset.count
             else:
-                p, s, im0, frame = path, '', im0s, getattr(dataset, 'frame', 0)
+                p, s, im0, frame = path, '', img_src, getattr(dataset, 'frame', 0)
 
 
             curr_frames[i] = im0
@@ -200,7 +260,7 @@ def detect(save_img=False, line_thickness=1):
             gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]  # normalization gain whwh
             if len(det):
                 # Rescale boxes from img_size to im0 size
-                det[:, :4] = scale_coords(img.shape[2:], det[:, :4], im0.shape).round()
+                det[:, :4] = rescale(img.shape[2:], det[:, :4], im0.shape).round()
 
                 # Print results
                 for c in det[:, -1].unique():
@@ -211,12 +271,11 @@ def detect(save_img=False, line_thickness=1):
                 confs = det[:, 4]
                 clss = det[:, 5]
 
+                t4 = time.time()
                 # pass detections to strongsort
-                t4 = time_synchronized()
                 outputs[i] = strongsort_list[i].update(xywhs.cpu(), confs.cpu(), clss.cpu(), im0)
-                t5 = time_synchronized()
+                t5 = time.time()
                 dt[3] += t5 - t4
-
 
                 # draw boxes for visualization
                 if len(outputs[i]) > 0:
@@ -258,7 +317,7 @@ def detect(save_img=False, line_thickness=1):
                             id = int(id)  # integer id
                             label = None if hide_labels else (f'{id} {names[c]}' if hide_conf else \
                                 (f'{id} {conf:.2f}' if hide_class else f'{id} {names[c]} {conf:.2f}'))
-                            plot_one_box(bboxes, im0, label=label, color=colors[int(cls)], line_thickness=line_thickness)
+                            plot_box_and_label(im0, line_thickness, bboxes, label=label, color=colors[int(cls)], txt_color=(255, 255, 255), font=cv2.FONT_HERSHEY_COMPLEX)
 
 
                 ### Print time (inference + NMS)
@@ -307,10 +366,8 @@ def detect(save_img=False, line_thickness=1):
                     cv2.putText(im0, '{}'.format(itemDict), (x1 + 10, y1 + 35), cv2.FONT_HERSHEY_SIMPLEX,0.7, (210, 210, 210), 2)
                     cv2.addWeighted(im0, 0.7, display, 1 - 0.7, 0, im0)
 
-
             #current frame // tesing
             cv2.imwrite('testing.jpg',im0)
-
 
             # Stream results
             if show_vid:
@@ -347,15 +404,16 @@ def detect(save_img=False, line_thickness=1):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--yolo-weights', nargs='+', type=str, default='weights/yolov7-tiny.pt', help='model.pt path(s)')
+    parser.add_argument('--yolo-weights', type=str, default='weights/yolov6s.pt', help='model.pt path')
+    parser.add_argument('--yolo-yaml', type=str, help='Model\'s YAML file')
     parser.add_argument('--strong-sort-weights', type=str, default=WEIGHTS / 'osnet_x0_25_msmt17.pt')
     parser.add_argument('--config-strongsort', type=str, default='strong_sort/configs/strong_sort.yaml')
     parser.add_argument('--source', type=str, default='inference/images', help='source')  # file/folder, 0 for webcam
     parser.add_argument('--img-size', type=int, default=640, help='inference size (pixels)')
     parser.add_argument('--conf-thres', type=float, default=0.25, help='object confidence threshold')
     parser.add_argument('--iou-thres', type=float, default=0.45, help='IOU threshold for NMS')
-    parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
-    parser.add_argument('--show-vid', action='store_true',default=True, help='display results')
+    parser.add_argument('--device', default='0', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
+    parser.add_argument('--show-vid', action='store_true',default=False, help='display results')
     parser.add_argument('--save-txt', action='store_true', help='save results to *.txt')
     parser.add_argument('--save-img', action='store_true', help='save results to *.jpg')
     parser.add_argument('--save-conf', action='store_true', help='save confidences in --save-txt labels')
@@ -382,7 +440,7 @@ if __name__ == '__main__':
     with torch.no_grad():
         if opt.update:  # update all models (to fix SourceChangeWarning)
             detect()
-            strip_optimizer(opt.weights)
+            strip_optimizer(opt.weights) # TODO
         else:
             detect()
 
